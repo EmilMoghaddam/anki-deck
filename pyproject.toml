@@ -1,0 +1,28 @@
+[project]
+name = "anki-deck"
+version = "0.1.0"
+description = "Brazilian Portuguese Anki deck generator for Spanish speakers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "rapidfuzz>=3.0",
+    "tqdm>=4.66",
+    "pydantic>=2.0",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "genanki>=0.13",
+    "edge-tts>=6.1",
+]
+
+[project.scripts]
+anki-deck = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
