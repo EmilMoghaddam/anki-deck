@@ -79,7 +79,11 @@ MAX_RETRIES = 3
 PROMPT_VERSION = "v3"
 CARD_EXAMPLE_COUNT = 5
 
-# Edge TTS (Brazilian Portuguese) for Anki .apkg export
+# Anki .apkg audio: "native" = device TTS (best for AnkiMobile), "edge" = bundled MP3
+ANKI_TTS_LANG = "pt_BR"
+ANKI_AUDIO_MODE_DEFAULT = "native"
+
+# Edge TTS (used only when exporting with --edge-audio)
 TTS_VOICE = "pt-BR-FranciscaNeural"
 TTS_RATE = "+0%"
 TTS_CONCURRENCY = 8

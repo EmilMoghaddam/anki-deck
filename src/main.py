@@ -86,13 +86,21 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_export(args: argparse.Namespace) -> None:
+    if args.edge_audio and args.no_audio:
+        raise SystemExit("Use either --edge-audio or --no-audio, not both.")
+    if args.edge_audio:
+        audio_mode = "edge"
+    elif args.no_audio:
+        audio_mode = "none"
+    else:
+        audio_mode = "native"
     run_export(
         input_path=args.input,
         output_path=args.output,
         excel_bom=args.excel_bom,
         apkg=args.apkg,
         apkg_path=args.apkg_output,
-        with_audio=not args.no_audio,
+        audio_mode=audio_mode,
     )
 
 
@@ -177,7 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--excel-bom", action="store_true")
     p_export.add_argument("--apkg", action="store_true", help="Also write ready-to-import .apkg")
     p_export.add_argument("--apkg-output", help="Output .apkg path")
-    p_export.add_argument("--no-audio", action="store_true", help="Skip Edge TTS when building .apkg")
+    p_export.add_argument(
+        "--edge-audio",
+        action="store_true",
+        help="Bundle Edge TTS MP3 files (220MB; often broken on AnkiMobile)",
+    )
+    p_export.add_argument("--no-audio", action="store_true", help="Text-only cards")
     p_export.set_defaults(func=cmd_export)
 
     p_all = sub.add_parser("run-all", help="Run full pipeline")

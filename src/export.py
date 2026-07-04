@@ -3,26 +3,60 @@
 import csv
 import json
 import logging
+import sqlite3
+import tempfile
+import zipfile
 from pathlib import Path
 
 import genanki
 
-from src.config import ANKI_APKG, ANKI_CSV, CARD_EXAMPLE_COUNT, CARDS_JSONL
+from src.config import (
+    ANKI_APKG,
+    ANKI_AUDIO_MODE_DEFAULT,
+    ANKI_CSV,
+    ANKI_TTS_LANG,
+    CARD_EXAMPLE_COUNT,
+    CARDS_JSONL,
+)
 from src.tts import (
-    card_audio_fields,
+    audio_path_for_text,
     collect_card_audio_items,
+    ensure_anki_compatible,
     ensure_audio,
+    is_valid_audio,
+    sound_field,
+    strip_html,
 )
 
 logger = logging.getLogger(__name__)
 
 # Stable IDs so re-exports update the same note type in Anki.
-# Bumped when note fields/templates change (v3: front without example, random 2 on back).
-ANKI_MODEL_ID = 1_985_092_385
+# v7: native device TTS (AnkiMobile-friendly). v6 edge MP3 kept via --edge-audio.
+ANKI_MODEL_ID_NATIVE = 1_985_092_389
+ANKI_MODEL_ID_EDGE = 1_985_092_388
 ANKI_DECK_ID = 1_985_092_384
 ANKI_DECK_NAME = "Brazilian Portuguese (ES speaker)"
 
-ANKI_FIELD_NAMES = [
+NATIVE_FIELD_NAMES = [
+    "Lemma",
+    "POS",
+    "English",
+    "Spanish",
+    *[f"Ex{i}_PT" for i in range(1, CARD_EXAMPLE_COUNT + 1)],
+    *[f"Ex{i}_TTS" for i in range(1, CARD_EXAMPLE_COUNT + 1)],
+    *[f"Ex{i}_EN" for i in range(1, CARD_EXAMPLE_COUNT + 1)],
+]
+
+PLAIN_FIELD_NAMES = [
+    "Lemma",
+    "POS",
+    "English",
+    "Spanish",
+    *[f"Ex{i}_PT" for i in range(1, CARD_EXAMPLE_COUNT + 1)],
+    *[f"Ex{i}_EN" for i in range(1, CARD_EXAMPLE_COUNT + 1)],
+]
+
+EDGE_FIELD_NAMES = [
     "Lemma",
     "POS",
     "English",
@@ -37,51 +71,77 @@ ANKI_CSS = """
 .card { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 18px; }
 .lemma { font-size: 1.35em; font-weight: bold; margin-bottom: 0.6em; }
 .pos { font-size: 0.75em; font-weight: normal; color: #666; }
-.sentence { line-height: 1.5; }
 .gloss { margin-bottom: 0.8em; }
 .gloss .es { color: #555; font-size: 0.95em; }
 .examples { text-align: left; line-height: 1.45; }
 .example { margin: 0.7em 0; padding-bottom: 0.5em; border-bottom: 1px solid #eee; }
 .example:last-child { border-bottom: none; }
 .en { color: #444; font-style: italic; }
+.tts { margin-top: 0.35em; }
 """
 
-ANKI_FRONT = """
-<div class="lemma">{{Lemma}} {{LemmaAudio}} <span class="pos">({{POS}})</span></div>
+
+def _native_front(lang: str) -> str:
+    return f"""
+<div class="lemma">{{{{Lemma}}}} <span class="pos">({{{{POS}}}})</span></div>
+<div class="tts">{{{{tts {lang}:Lemma}}}}</div>
 """.strip()
 
-# JavaScript picks 2 distinct examples per review (reshuffles each time the card is shown).
-ANKI_BACK = """
+
+def _native_back(lang: str) -> str:
+    examples = "\n".join(
+        f'<div class="example">{{{{Ex{i}_PT}}}}<br>'
+        f'<div class="tts">{{{{tts {lang}:Ex{i}_TTS}}}}</div>'
+        f'<span class="en">{{{{Ex{i}_EN}}}}</span></div>'
+        for i in range(1, CARD_EXAMPLE_COUNT + 1)
+    )
+    return f"""
+<div class="gloss">
+<div><b>{{{{English}}}}</b></div>
+<div class="es">{{{{Spanish}}}}</div>
+</div>
+<div class="examples">
+{examples}
+</div>
+""".strip()
+
+
+ANKI_FRONT_EDGE = """
+<div class="lemma">{{Lemma}} <span class="pos">({{POS}})</span></div>
+<div class="tts">{{LemmaAudio}}</div>
+""".strip()
+
+ANKI_BACK_EDGE = """
 <div class="gloss">
 <div><b>{{English}}</b></div>
 <div class="es">{{Spanish}}</div>
 </div>
-<div id="pool" style="display:none">
-<div class="ex">{{Ex1_PT}} {{Ex1_Audio}}<br><span class="en">{{Ex1_EN}}</span></div>
-<div class="ex">{{Ex2_PT}} {{Ex2_Audio}}<br><span class="en">{{Ex2_EN}}</span></div>
-<div class="ex">{{Ex3_PT}} {{Ex3_Audio}}<br><span class="en">{{Ex3_EN}}</span></div>
-<div class="ex">{{Ex4_PT}} {{Ex4_Audio}}<br><span class="en">{{Ex4_EN}}</span></div>
-<div class="ex">{{Ex5_PT}} {{Ex5_Audio}}<br><span class="en">{{Ex5_EN}}</span></div>
+<div class="examples">
+<div class="example">{{Ex1_PT}}<br><div class="tts">{{Ex1_Audio}}</div><br><span class="en">{{Ex1_EN}}</span></div>
+<div class="example">{{Ex2_PT}}<br><div class="tts">{{Ex2_Audio}}</div><br><span class="en">{{Ex2_EN}}</span></div>
+<div class="example">{{Ex3_PT}}<br><div class="tts">{{Ex3_Audio}}</div><br><span class="en">{{Ex3_EN}}</span></div>
+<div class="example">{{Ex4_PT}}<br><div class="tts">{{Ex4_Audio}}</div><br><span class="en">{{Ex4_EN}}</span></div>
+<div class="example">{{Ex5_PT}}<br><div class="tts">{{Ex5_Audio}}</div><br><span class="en">{{Ex5_EN}}</span></div>
 </div>
-<div class="examples" id="show"></div>
-<script>
-(function () {
-  var pool = Array.from(document.querySelectorAll("#pool .ex"));
-  for (var i = pool.length - 1; i > 0; i--) {
-    var j = Math.floor(Math.random() * (i + 1));
-    var tmp = pool[i];
-    pool[i] = pool[j];
-    pool[j] = tmp;
-  }
-  var show = document.getElementById("show");
-  pool.slice(0, 2).forEach(function (el) {
-    var div = document.createElement("div");
-    div.className = "example";
-    div.innerHTML = el.innerHTML;
-    show.appendChild(div);
-  });
-})();
-</script>
+""".strip()
+
+
+ANKI_FRONT_NONE = """
+<div class="lemma">{{Lemma}} <span class="pos">({{POS}})</span></div>
+""".strip()
+
+ANKI_BACK_NONE = """
+<div class="gloss">
+<div><b>{{English}}</b></div>
+<div class="es">{{Spanish}}</div>
+</div>
+<div class="examples">
+<div class="example">{{Ex1_PT}}<br><span class="en">{{Ex1_EN}}</span></div>
+<div class="example">{{Ex2_PT}}<br><span class="en">{{Ex2_EN}}</span></div>
+<div class="example">{{Ex3_PT}}<br><span class="en">{{Ex3_EN}}</span></div>
+<div class="example">{{Ex4_PT}}<br><span class="en">{{Ex4_EN}}</span></div>
+<div class="example">{{Ex5_PT}}<br><span class="en">{{Ex5_EN}}</span></div>
+</div>
 """.strip()
 
 CSV_COLUMNS = [
@@ -155,44 +215,139 @@ def card_to_row(card: dict) -> dict:
     return row
 
 
-def card_to_anki_fields(card: dict, audio: dict[str, str] | None = None) -> list[str]:
-    """Convert a card record to genanki note fields."""
+def card_to_native_fields(card: dict) -> list[str]:
+    """Plain-text TTS fields + HTML display fields for device speech."""
     row = card_to_row(card)
-    audio = audio or {}
+    examples = _all_examples(card)
     return [
-        row["Lemma"],
+        card["lemma"],
         row["PartOfSpeech"],
         row["EnglishTranslations"].replace(";", ", "),
         row["SpanishTranslations"].replace(";", ", "),
-        *[row[f"Sentence{i}_PT"] for i in range(1, CARD_EXAMPLE_COUNT + 1)],
-        *[row[f"Sentence{i}_EN"] for i in range(1, CARD_EXAMPLE_COUNT + 1)],
-        audio.get("LemmaAudio", ""),
-        *[audio.get(f"Ex{i}_Audio", "") for i in range(1, CARD_EXAMPLE_COUNT + 1)],
+        *[ex.get("pt", "") for ex in examples],
+        *[strip_html(ex.get("pt", "")) for ex in examples],
+        *[ex.get("en", "") for ex in examples],
     ]
 
 
-def build_anki_model() -> genanki.Model:
-    """Return the shared PT-BR vocabulary note type."""
+def card_to_edge_fields(card: dict) -> list[str]:
+    """Separate [sound:…] fields (no HTML in audio fields) for bundled MP3."""
+    row = card_to_row(card)
+    examples = _all_examples(card)
+    lemma_path = audio_path_for_text(card["lemma"])
+    lemma_audio = sound_field(lemma_path.name) if is_valid_audio(lemma_path) else ""
+    audio_fields = []
+    for ex in examples:
+        path = audio_path_for_text(ex.get("pt", ""))
+        audio_fields.append(sound_field(path.name) if is_valid_audio(path) else "")
+    return [
+        card["lemma"],
+        row["PartOfSpeech"],
+        row["EnglishTranslations"].replace(";", ", "),
+        row["SpanishTranslations"].replace(";", ", "),
+        *[ex.get("pt", "") for ex in examples],
+        *[ex.get("en", "") for ex in examples],
+        lemma_audio,
+        *audio_fields,
+    ]
+
+
+def card_to_plain_fields(card: dict) -> list[str]:
+    """Text-only fields (no audio)."""
+    row = card_to_row(card)
+    examples = _all_examples(card)
+    return [
+        card["lemma"],
+        row["PartOfSpeech"],
+        row["EnglishTranslations"].replace(";", ", "),
+        row["SpanishTranslations"].replace(";", ", "),
+        *[ex.get("pt", "") for ex in examples],
+        *[ex.get("en", "") for ex in examples],
+    ]
+
+
+def build_anki_model(audio_mode: str) -> genanki.Model:
+    """Return note type for native TTS, bundled edge audio, or text-only."""
+    if audio_mode == "native":
+        return genanki.Model(
+            ANKI_MODEL_ID_NATIVE,
+            "PT-BR Vocab (ES speaker)",
+            fields=[{"name": name} for name in NATIVE_FIELD_NAMES],
+            templates=[
+                {
+                    "name": "PT → EN",
+                    "qfmt": _native_front(ANKI_TTS_LANG),
+                    "afmt": _native_back(ANKI_TTS_LANG),
+                }
+            ],
+            css=ANKI_CSS,
+        )
+    if audio_mode == "edge":
+        return genanki.Model(
+            ANKI_MODEL_ID_EDGE,
+            "PT-BR Vocab (ES speaker)",
+            fields=[{"name": name} for name in EDGE_FIELD_NAMES],
+            templates=[
+                {
+                    "name": "PT → EN",
+                    "qfmt": ANKI_FRONT_EDGE,
+                    "afmt": ANKI_BACK_EDGE,
+                }
+            ],
+            css=ANKI_CSS,
+        )
     return genanki.Model(
-        ANKI_MODEL_ID,
+        ANKI_MODEL_ID_NATIVE,
         "PT-BR Vocab (ES speaker)",
-        fields=[{"name": name} for name in ANKI_FIELD_NAMES],
+        fields=[{"name": name} for name in PLAIN_FIELD_NAMES],
         templates=[
             {
                 "name": "PT → EN",
-                "qfmt": ANKI_FRONT,
-                "afmt": ANKI_BACK,
+                "qfmt": ANKI_FRONT_NONE,
+                "afmt": ANKI_BACK_NONE,
             }
         ],
         css=ANKI_CSS,
     )
 
 
+def _all_examples(card: dict) -> list[dict]:
+    """Return up to CARD_EXAMPLE_COUNT examples in generation order."""
+    examples = list(card.get("examples", []))
+    while len(examples) < CARD_EXAMPLE_COUNT:
+        examples.append({"pt": "", "en": ""})
+    return examples[:CARD_EXAMPLE_COUNT]
+
+
+def disable_apkg_autoplay(apkg_path: Path) -> None:
+    """Turn off automatic audio playback in the deck options embedded in .apkg."""
+    tmp = apkg_path.with_suffix(".tmp.apkg")
+    with zipfile.ZipFile(apkg_path, "r") as zin:
+        with tempfile.TemporaryDirectory() as td:
+            col_path = Path(td) / "collection.anki2"
+            zin.extract("collection.anki2", td)
+            conn = sqlite3.connect(col_path)
+            dconf = json.loads(conn.execute("SELECT dconf FROM col").fetchone()[0])
+            for cfg in dconf.values():
+                cfg["autoplay"] = False
+                cfg["replayq"] = False
+            conn.execute("UPDATE col SET dconf = ?", (json.dumps(dconf),))
+            conn.commit()
+            conn.close()
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == "collection.anki2":
+                        zout.write(col_path, "collection.anki2")
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+    tmp.replace(apkg_path)
+
+
 def export_anki_apkg(
     cards: list[dict] | None = None,
     output_path: str | None = None,
     deck_name: str = ANKI_DECK_NAME,
-    with_audio: bool = True,
+    audio_mode: str = "native",
 ) -> Path:
     """Write a ready-to-import .apkg file with note type and deck."""
     if cards is None:
@@ -202,26 +357,43 @@ def export_anki_apkg(
     out.parent.mkdir(parents=True, exist_ok=True)
 
     media_files: list[str] = []
-    if with_audio:
+    if audio_mode == "edge":
         items = collect_card_audio_items(cards)
-        logger.info("Generating TTS for %d unique clips (lemma + examples)", len(items))
+        logger.info("Generating Edge TTS for %d unique clips (lemma + examples)", len(items))
         ensure_audio(items)
-        media_files = sorted({str(path) for _, path in items if path.exists()})
+        paths = [path for _, path in items if is_valid_audio(path)]
+        invalid = sum(1 for _, path in items if path.exists() and not is_valid_audio(path))
+        if invalid:
+            logger.warning("Skipping %d invalid/empty audio clips", invalid)
+        ensure_anki_compatible(paths)
+        media_files = sorted({str(path) for path in paths})
         logger.info("Bundling %d audio files into .apkg", len(media_files))
+    elif audio_mode == "native":
+        logger.info("Using device native TTS (%s) — no media bundled", ANKI_TTS_LANG)
+    else:
+        logger.info("Exporting text-only cards (no audio)")
 
-    model = build_anki_model()
+    model = build_anki_model(audio_mode)
     deck = genanki.Deck(ANKI_DECK_ID, deck_name)
 
+    field_fn = {
+        "native": card_to_native_fields,
+        "edge": card_to_edge_fields,
+        "none": card_to_plain_fields,
+    }[audio_mode]
+
     for card in cards:
-        audio = card_audio_fields(card) if with_audio else {}
-        note = genanki.Note(model=model, fields=card_to_anki_fields(card, audio))
+        note = genanki.Note(model=model, fields=field_fn(card))
         deck.add_note(note)
 
     package = genanki.Package(deck)
     if media_files:
         package.media_files = media_files
     package.write_to_file(out)
-    logger.info("Exported %d cards to %s", len(cards), out)
+    if audio_mode in ("native", "edge"):
+        disable_apkg_autoplay(out)
+        logger.info("Disabled automatic audio playback in deck options")
+    logger.info("Exported %d cards to %s (%s audio)", len(cards), out, audio_mode)
     return out
 
 
@@ -254,11 +426,12 @@ def run_export(
     excel_bom: bool = False,
     apkg: bool = False,
     apkg_path: str | None = None,
-    with_audio: bool = True,
+    audio_mode: str | None = None,
 ) -> Path:
     """Run export stage."""
     cards = load_cards_jsonl(input_path)
     export_anki_csv(cards, output_path, excel_bom=excel_bom)
     if apkg:
-        return export_anki_apkg(cards, output_path=apkg_path, with_audio=with_audio)
+        mode = audio_mode or ANKI_AUDIO_MODE_DEFAULT
+        return export_anki_apkg(cards, output_path=apkg_path, audio_mode=mode)
     return Path(output_path) if output_path else ANKI_CSV
